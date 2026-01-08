@@ -5,6 +5,7 @@ import torch
 import argparse
 import numpy as np
 import torch.multiprocessing as mp
+import torch.distributed.checkpoint as dcp  # <--- Added DCP
 from torch.utils.data import DataLoader, Subset
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
@@ -35,7 +36,6 @@ def evaluate_single_image(model, processor, image, classes, device, prompt_templ
     Correctly constructs inputs by concatenating [Image+Query] prefix with [Class Name] suffix.
     """
     # 1. PREPARE THE PREFIX (Image + User Query) ONCE
-    # This ensures input_ids contains the correct image placeholders.
     prefix_msg = [
         {
             "role": "user",
@@ -59,7 +59,6 @@ def evaluate_single_image(model, processor, image, classes, device, prompt_templ
     )
     
     # Extract the base components
-    # prefix_input_ids shape: [1, Seq_Len_with_Image_Tokens]
     prefix_input_ids = prefix_inputs.input_ids[0].to(device) 
     
     # Vision tensors
@@ -79,7 +78,6 @@ def evaluate_single_image(model, processor, image, classes, device, prompt_templ
         
         for cls_name in batch_classes:
             # Tokenize JUST the class name. 
-            # Note: We use add_special_tokens=False to avoid adding extra BOS/EOS in the middle
             suffix_ids = processor.tokenizer(cls_name, add_special_tokens=False).input_ids
             suffix_tensor = torch.tensor(suffix_ids, device=device)
             
@@ -94,7 +92,6 @@ def evaluate_single_image(model, processor, image, classes, device, prompt_templ
             batch_labels.append(labels)
             
         # 3. PAD THE BATCH
-        # Manually pad sequences to the longest in this batch
         max_len = max(len(x) for x in batch_input_ids)
         pad_id = processor.tokenizer.pad_token_id
         
@@ -109,8 +106,6 @@ def evaluate_single_image(model, processor, image, classes, device, prompt_templ
             final_attention[idx, :l] = 1 # 1 for valid tokens, 0 for pad
             
         # 4. EXPAND VISION TENSORS
-        # Repeat the visual features 'current_batch_size' times.
-        # This matches the batch size of the text inputs.
         batch_pixel_values = pixel_values.repeat(current_batch_size, 1)
         batch_image_grid_thw = image_grid_thw.repeat(current_batch_size, 1)
         
@@ -132,17 +127,33 @@ def worker_fn(rank, world_size, args, shared_results):
     setup_process(rank, world_size)
     device = f"cuda:{rank}"
     
-    print(f"[GPU {rank}] Loading Model...")
+    print(f"[GPU {rank}] Initializing Architecture...")
+    
     model = Qwen2VLForConditionalGeneration.from_pretrained(
         args.model_id,
         torch_dtype=torch.bfloat16,
         attn_implementation="sdpa",
-        device_map=device
+        device_map=device 
     )
-    model.eval()
     processor = AutoProcessor.from_pretrained(args.model_id)
     
-    # Dataset Setup
+    if args.checkpoint_path:
+        print(f"[GPU {rank}] Loading Checkpoint from {args.checkpoint_path}...")
+        
+        loading_state_dict = {"model": model}
+        
+        try:
+            dcp.load(
+                state_dict=loading_state_dict,
+                checkpoint_id=args.checkpoint_path,
+            )
+            print(f"[GPU {rank}] Checkpoint loaded successfully.")
+        except Exception as e:
+            print(f"[GPU {rank}] ERROR loading checkpoint: {e}")
+            return
+
+    model.eval()
+    
     imgs_path = os.path.join(args.data_root, 'images/jpg')
     labels_path = os.path.join(args.data_root, 'labels.npz')
     cat_path = os.path.join(args.data_root, 'cat_to_name.json')
@@ -155,10 +166,10 @@ def worker_fn(rank, world_size, args, shared_results):
 
     with open(args.splits_path, 'rb') as f:
         splits = json.load(f)
+    
     test_indices = splits['trnid']
     if min(test_indices) == 1: test_indices = [x - 1 for x in test_indices]
 
-    # Distributed Split
     my_indices = test_indices[rank::world_size]
     
     subset = Subset(dataset, my_indices)
@@ -170,7 +181,7 @@ def worker_fn(rank, world_size, args, shared_results):
     local_hits_top3 = []
     local_hits_top5 = []
     
-    query_text = "Identify the specific type of this flower."
+    query_text = "What type of flower is this? Answer briefly"
 
     for img, _, label_idx in tqdm(loader, position=rank, desc=f"GPU {rank}"):
         true_label = int(label_idx)
@@ -185,7 +196,6 @@ def worker_fn(rank, world_size, args, shared_results):
         local_hits_top3.append(true_label in predicted_indices[:3])
         local_hits_top5.append(true_label in predicted_indices[:5])
 
-    # Save results
     shared_results[rank] = (
         len(local_hits_top1),
         sum(local_hits_top1),
@@ -197,6 +207,7 @@ def worker_fn(rank, world_size, args, shared_results):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_id", type=str, default="Qwen/Qwen2-VL-2B-Instruct")
+    parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to distributed checkpoint directory (e.g. checkpoints/checkpoint-step-300)")
     parser.add_argument("--data_root", type=str, default="/data-net/storage2/datasets/OxfordF")
     parser.add_argument("--splits_path", type=str, default="/data-net/storage2/datasets/OxfordF/my_data.json")
     parser.add_argument("--project_name", type=str, default="clip-flowers-finetune")
@@ -234,7 +245,7 @@ def main():
     print(f"Top-5: {acc_t5:.4f}")
 
     wandb.init(
-        name=f"baseline-{args.model_id.split('/')[-1]}-parallel",
+        name=f"eval-{args.model_id.split('/')[-1]}-parallel",
         entity=args.entity_name,
         project=args.project_name,
         config=vars(args)

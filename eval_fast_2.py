@@ -26,7 +26,7 @@ def evaluate_generative(model, processor, loader, classes, device):
         batch_size = len(images)
         
         # 1. Prepare Inputs
-        queries = ["Identify the specific type of this flower. Answer concisely."] * batch_size
+        queries = ["What type of flower is this? Answer briefly"] * batch_size
         
         messages_batch = []
         for img, q in zip(images, queries):

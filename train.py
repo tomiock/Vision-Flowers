@@ -14,8 +14,6 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support, cla
 import clip
 from dataset import FlowersDataset
 
-CACHE_DIR = "/data/users/tockier/clip_cache"
-
 def seed_everything(seed):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
@@ -70,7 +68,6 @@ def validate_loss(model, loader, device):
         for images, texts, _ in loader:
             images, texts = images.to(device), texts.to(device)
             
-            # Standard Forward Pass
             logits_per_image, logits_per_text = model(images, texts)
             
             ground_truth = torch.arange(len(images), dtype=torch.long, device=device)
@@ -82,20 +79,24 @@ def validate_loss(model, loader, device):
     return total_loss / len(loader)
 
 def evaluate_zero_shot(model, loader, classes, prompt_template, device):
+    """
+    Evaluates Top-1, Top-3, and Top-5 accuracy.
+    Returns: (y_true, y_pred_top1, acc1, acc3, acc5)
+    """
     model.eval()
     print("Building Zero-shot Classifier...")
     
-    # Pre-compute text features for all classes
-    # We force .float() here to match the model dtype
     text_inputs = torch.cat([clip.tokenize(prompt_template.format(c)) for c in classes]).to(device)
     
     with torch.no_grad():
         text_features = model.encode_text(text_inputs)
         text_features /= text_features.norm(dim=-1, keepdim=True)
 
-    all_preds = []
+    all_k_preds = [] # Will store indices (N, 5)
     all_labels = []
     
+    print(f"Evaluating on {len(loader.dataset)} images...")
+
     with torch.no_grad():
         for images, _, labels in loader:
             images = images.to(device)
@@ -103,17 +104,31 @@ def evaluate_zero_shot(model, loader, classes, prompt_template, device):
             image_features = model.encode_image(images)
             image_features /= image_features.norm(dim=-1, keepdim=True)
 
-            # Similarity calculation
             similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
-            values, indices = similarity.topk(1)
             
-            all_preds.extend(indices.squeeze().cpu().numpy())
-            all_labels.extend(labels.numpy())
+            values, indices = similarity.topk(5) 
+            
+            all_k_preds.append(indices.cpu())
+            all_labels.append(labels)
 
-    return np.array(all_labels), np.array(all_preds)
+    all_k_preds = torch.cat(all_k_preds, dim=0) 
+    all_labels = torch.cat(all_labels, dim=0)
+    
+    ground_truth = all_labels.view(-1, 1)
+    
+    matches = (all_k_preds == ground_truth)
+    
+    top1 = matches[:, :1].any(dim=1).float().mean().item()
+    top3 = matches[:, :3].any(dim=1).float().mean().item()
+    top5 = matches[:, :5].any(dim=1).float().mean().item()
+    
+    print(f"Top-1: {top1:.4f} | Top-3: {top3:.4f} | Top-5: {top5:.4f}")
+    
+    # Return 1D arrays for sklearn metrics (just top-1) AND the scalar accuracies
+    return all_labels.numpy(), all_k_preds[:, 0].numpy(), top1, top3, top5
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune CLIP on Oxford Flowers (Float32)")
+    parser = argparse.ArgumentParser(description="Fine-tune CLIP on Oxford Flowers (Float32 + TopK)")
     
     parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
@@ -148,11 +163,8 @@ def main():
         config=vars(args)
     )
 
-    # LOAD MODEL
-    model, preprocess = clip.load(args.architecture, device=device, jit=False, download_root=CACHE_DIR)
+    model, preprocess = clip.load(args.architecture, device=device, jit=False) 
     
-    # CRITICAL FIX: Force model to Float32. 
-    # clip.load() defaults to float16 on CUDA, which causes underflow without a Scaler.
     model = model.float()
 
     imgs_path = os.path.join(args.data_root, 'images/jpg')
@@ -172,6 +184,9 @@ def main():
 
     train_indices = splits['valid'] + splits['tstid']
     test_indices = splits['trnid']
+    
+    #train_indices = splits['trnid']
+    #test_indices = splits['tstid'] + splits['valid']
     
     # Fix 1-based indexing if present
     if min(train_indices) == 1 or min(test_indices) == 1:
@@ -219,15 +234,17 @@ def main():
     checkpoint = torch.load(os.path.join(args.output_dir, "best_model.pt"))
     model.load_state_dict(checkpoint['state_dict'])
 
-    y_true, y_pred = evaluate_zero_shot(model, val_loader, dataset.classes, args.prompt_template, device)
+    y_true, y_pred, acc1, acc3, acc5 = evaluate_zero_shot(model, val_loader, dataset.classes, args.prompt_template, device)
 
-    acc = accuracy_score(y_true, y_pred)
     precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='weighted', zero_division=0)
 
-    print(f"Final Accuracy: {acc:.4f}")
+    print(f"Final Accuracy (Top-1): {acc1:.4f}")
     
     wandb.log({
-        "eval/accuracy": acc,
+        "eval/accuracy": acc1,
+        "eval/top1": acc1,
+        "eval/top3": acc3,
+        "eval/top5": acc5,
         "eval/f1_weighted": f1,
         "eval/precision_weighted": precision,
         "eval/recall_weighted": recall
