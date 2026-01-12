@@ -26,11 +26,7 @@ We use the [Oxford Flowers 102 dataset](https://www.robots.ox.ac.uk/~vgg/data/fl
 * `baseline_eval.py`: Evaluates a vanilla, pretrained CLIP model (zero-shot) to establish a performance floor.
 * `test_models.py`: Utility script to compare parameter counts across CLIP architectures (e.g., ViT-B/32 vs ViT-L/14).
 
-### 2. Generative VLM (Qwen2-VL)
-* `create_dataset.py` & `create_complex_dataset.py`: Converts raw data into `.parquet` shards and uses a "Teacher" model to generate botanical reasoning descriptions for distillation.
-* `eval_fast_2.py` & `eval_parallel.py`: Scripts for generative accuracy checking and high-performance log-likelihood scoring.
-
-### 3. Dataset Exploration & Visualization (`data_Exploration/`)
+### 2. Dataset Exploration & Visualization (`data_Exploration/`)
 * `dataset_Description.py`: Generates a bar chart showing the class distribution across the 102 categories and prints image counts per split.
 * `class_distribution.py`: Computes and plots the Kernel Density Estimation (KDE) of **Hue, Saturation, and Value (HSV)** for a specific flower class.
 * `isomap.py`: Performs **Isomap dimensionality reduction** on class centroids (HSV features) and visualizes the manifold using representative images.
