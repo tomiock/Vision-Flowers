@@ -31,8 +31,7 @@ We use the [Oxford Flowers 102 dataset](https://www.robots.ox.ac.uk/~vgg/data/fl
 * `class_distribution.py`: Computes and plots the Kernel Density Estimation (KDE) of **Hue, Saturation, and Value (HSV)** for a specific flower class.
 * `isomap.py`: Performs **Isomap dimensionality reduction** on class centroids (HSV features) and visualizes the manifold using representative images.
 
-
-### 4. Interactive Tools
+### 3. Interactive Tools
 * `web.py`: A **Streamlit-based** web application to explore the dataset, filter by class name, and view images in grid or single-focus modes.
 
 ---
