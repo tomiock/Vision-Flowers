@@ -11,7 +11,7 @@ from dataset import FlowersDataset
 
 TEACHER_MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 NUM_SHARDS = 4
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 
 def get_teacher_reasoning_batch(model, processor, images, true_labels, device):
     """
@@ -20,9 +20,9 @@ def get_teacher_reasoning_batch(model, processor, images, true_labels, device):
     prompts = []
     for label in true_labels:
         text_prompt = (
-            f"You are a botanical expert. This image shows a **{label}** flower. "
-            f"Describe the specific visual features visible in this image (such as petal shape, color, texture, stamen, or leaves) "
-            f"that confirm it is a {label}. Be concise and factual."
+            f"You are a botanical expert."
+            f"Describe the specific visual features visible in the flower that confirm it is a {label}."
+            f"Format your answer giving first the visual features and then explaining why the flower belongs to the provided label."
         )
         prompts.append(text_prompt)
 
@@ -44,7 +44,7 @@ def get_teacher_reasoning_batch(model, processor, images, true_labels, device):
     with torch.no_grad():
         generated_ids = model.generate(
             **inputs, 
-            max_new_tokens=128,
+            max_new_tokens=512,
             do_sample=False 
         )
 
@@ -129,7 +129,7 @@ def main():
                 img_bytes = img_byte_arr.getvalue()
                 
                 images_field = [{'bytes': img_bytes}]
-                
+               flowers 
                 assistant_response = f"{desc} It is a {label}"
                 
                 texts_field = [

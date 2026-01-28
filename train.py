@@ -9,7 +9,7 @@ import random
 import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader, Subset
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
+from sklearn.metrics import precision_recall_fscore_support, classification_report
 
 import clip
 from dataset import FlowersDataset
@@ -30,11 +30,86 @@ def save_checkpoint(model, optimizer, epoch, filename):
     }
     torch.save(state, filename)
 
-def train_one_epoch(model, loader, optimizer, device, epoch):
+def configure_model_freezing(model, mode):
+    """
+    Configures which parts of the model are frozen/trainable.
+    
+    Modes:
+    - "text_only": Freeze vision encoder, train text encoder.
+    - "vision_only": Freeze text encoder, train vision encoder.
+    - "early_layers": Freeze first 2 layers of both transformers.
+    - "none": Train everything (default fine-tuning).
+    """
+    print(f"\nConfiguring Model Freezing: Mode = {mode}")
+    # Reset all parameters to trainable first
+    for param in model.parameters():
+        param.requires_grad = True
+
+    if mode == "text_only":
+        for param in model.visual.parameters():
+            param.requires_grad = False
+        print(" -> Vision Encoder FROZEN. Training Text Encoder only.")
+
+    elif mode == "vision_only":
+        for param in model.transformer.parameters():
+            param.requires_grad = False
+        for param in model.token_embedding.parameters():
+            param.requires_grad = False
+        for param in model.ln_final.parameters():
+            param.requires_grad = False
+        if hasattr(model, 'text_projection'):
+             model.text_projection.requires_grad = False
+             
+        print(" -> Text Encoder FROZEN. Training Vision Encoder only.")
+
+    elif mode == "early_layers":
+        for param in model.parameters():
+            param.requires_grad = False
+
+        num_visual_layers = len(model.visual.transformer.resblocks)
+        for i, block in enumerate(model.visual.transformer.resblocks):
+            if i >= num_visual_layers - 2:
+                for param in block.parameters():
+                    param.requires_grad = True
+        
+        for param in model.visual.ln_post.parameters():
+            param.requires_grad = True
+            
+        model.visual.proj.requires_grad = True
+
+        num_text_layers = len(model.transformer.resblocks)
+        for i, block in enumerate(model.transformer.resblocks):
+            if i >= num_text_layers - 2:
+                for param in block.parameters():
+                    param.requires_grad = True
+                    
+        for param in model.ln_final.parameters():
+            param.requires_grad = True
+            
+        model.text_projection.requires_grad = True
+
+        print(" -> All parameters FROZEN except the LAST 2 LAYERS and FINAL PROJECTIONS of both encoders.")
+
+    elif mode == "none":
+        print(" -> All parameters TRAINABLE.")
+        
+    else:
+        raise ValueError(f"Unknown freeze mode: {mode}")
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f" -> Trainable Params: {trainable_params:,} / {total_params:,} ({100 * trainable_params / total_params:.2f}%)")
+    
+    return trainable_params
+
+def train_one_epoch(model, loader, optimizer, device):
+    """
+    Implements the Symmetric InfoNCE Loss (CLIP Loss).
+    L = 1/N * sum( (L_v2t + L_t2v) / 2 )
+    """
     model.train()
     total_loss = 0
-    loss_img = nn.CrossEntropyLoss()
-    loss_txt = nn.CrossEntropyLoss()
+    loss_fct = nn.CrossEntropyLoss()
     
     for step, (images, texts, _) in enumerate(loader):
         images, texts = images.to(device), texts.to(device)
@@ -45,46 +120,49 @@ def train_one_epoch(model, loader, optimizer, device, epoch):
         
         ground_truth = torch.arange(len(images), dtype=torch.long, device=device)
         
-        loss = (loss_img(logits_per_image, ground_truth) + 
-                loss_txt(logits_per_text, ground_truth)) / 2
+        loss_img = loss_fct(logits_per_image, ground_truth)
+        loss_txt = loss_fct(logits_per_text, ground_truth)
+        loss = (loss_img + loss_txt) / 2
         
         loss.backward()
+        
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        
         optimizer.step()
 
         batch_loss = loss.item()
         total_loss += batch_loss
 
-        wandb.log({"train/batch_loss": batch_loss, "train/lr": optimizer.param_groups[0]['lr']})
+        current_tau = 1 / model.logit_scale.exp().item()
+        wandb.log({
+            "train/batch_loss": batch_loss, 
+            "train/lr": optimizer.param_groups[0]['lr'],
+            "train/tau": current_tau
+        })
         
     return total_loss / len(loader)
 
 def validate_loss(model, loader, device):
     model.eval()
     total_loss = 0
-    loss_img = nn.CrossEntropyLoss()
-    loss_txt = nn.CrossEntropyLoss()
+    loss_fct = nn.CrossEntropyLoss()
 
     with torch.no_grad():
         for images, texts, _ in loader:
             images, texts = images.to(device), texts.to(device)
             
             logits_per_image, logits_per_text = model(images, texts)
-            
             ground_truth = torch.arange(len(images), dtype=torch.long, device=device)
-            loss = (loss_img(logits_per_image, ground_truth) + 
-                    loss_txt(logits_per_text, ground_truth)) / 2
+            
+            loss = (loss_fct(logits_per_image, ground_truth) + 
+                    loss_fct(logits_per_text, ground_truth)) / 2
             
             total_loss += loss.item()
 
     return total_loss / len(loader)
 
 def evaluate_zero_shot(model, loader, classes, prompt_template, device):
-    """
-    Evaluates Top-1, Top-3, and Top-5 accuracy.
-    Returns: (y_true, y_pred_top1, acc1, acc3, acc5)
-    """
     model.eval()
-    print("Building Zero-shot Classifier...")
     
     text_inputs = torch.cat([clip.tokenize(prompt_template.format(c)) for c in classes]).to(device)
     
@@ -92,7 +170,7 @@ def evaluate_zero_shot(model, loader, classes, prompt_template, device):
         text_features = model.encode_text(text_inputs)
         text_features /= text_features.norm(dim=-1, keepdim=True)
 
-    all_k_preds = [] # Will store indices (N, 5)
+    all_k_preds = [] 
     all_labels = []
     
     print(f"Evaluating on {len(loader.dataset)} images...")
@@ -104,9 +182,9 @@ def evaluate_zero_shot(model, loader, classes, prompt_template, device):
             image_features = model.encode_image(images)
             image_features /= image_features.norm(dim=-1, keepdim=True)
 
-            similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+            similarity = image_features @ text_features.T
             
-            values, indices = similarity.topk(5) 
+            values, indices = similarity.topk(5, dim=-1) 
             
             all_k_preds.append(indices.cpu())
             all_labels.append(labels)
@@ -124,29 +202,29 @@ def evaluate_zero_shot(model, loader, classes, prompt_template, device):
     
     print(f"Top-1: {top1:.4f} | Top-3: {top3:.4f} | Top-5: {top5:.4f}")
     
-    # Return 1D arrays for sklearn metrics (just top-1) AND the scalar accuracies
     return all_labels.numpy(), all_k_preds[:, 0].numpy(), top1, top3, top5
 
 def main():
-    parser = argparse.ArgumentParser(description="Fine-tune CLIP on Oxford Flowers (Float32 + TopK)")
+    parser = argparse.ArgumentParser(description="Fine-tune CLIP on Oxford Flowers (Temperature Ablation)")
     
-    parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
     parser.add_argument("--epochs", type=int, default=5, help="Number of epochs")
-    parser.add_argument("--wd", type=float, default=0.2, help="Weight decay")
-    parser.add_argument("--beta1", type=float, default=0.9, help="Adam Beta1")
-    parser.add_argument("--beta2", type=float, default=0.98, help="Adam Beta2")
-    parser.add_argument("--eps", type=float, default=1e-6, help="Adam Epsilon")
+    parser.add_argument("--wd", type=float, default=0.1, help="Weight decay")
     parser.add_argument("--architecture", type=str, default="ViT-B/32", help="CLIP Architecture")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--prompt_template", type=str, default="an image of the {} flower", help="Prompt template")
+    parser.add_argument("--prompt_template", type=str, default="a photo of a {}, a type of flower.", help="Prompt template")
+
+    parser.add_argument("--freeze", type=str, default="none")
     
-    # Paths
+    parser.add_argument("--temperature", type=float, default=0.07, help="Initial temperature value (tau)")
+    parser.add_argument("--learn_temperature", action="store_true", help="If True, tau is trainable. If False, it is fixed.")
+    parser.add_argument("--tau_lr", type=float, default=None, help="Specific learning rate for temperature (tau). If None, uses main lr.")
+    
     parser.add_argument("--data_root", type=str, default="/data-net/storage2/datasets/OxfordF", help="Dataset root")
     parser.add_argument("--splits_path", type=str, default="/data-net/storage2/datasets/OxfordF/my_data.json", help="Splits JSON path")
     parser.add_argument("--output_dir", type=str, default="./checkpoints", help="Directory to save models")
 
-    # Metadata
     parser.add_argument("--project_name", type=str, default="clip-flowers-finetune")
     parser.add_argument("--entity_name", type=str, default="uab-deeplearning-2025")
 
@@ -156,16 +234,44 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    wandb.init(
-        name=f"run-{args.architecture}-lr{args.lr}-bs{args.batch_size}",
+    run = wandb.init(
+        name=f"run-{args.architecture}-lr{args.lr}-tau{args.temperature}-{'learn' if args.learn_temperature else 'fixed'}",
         entity=args.entity_name,
         project=args.project_name,
-        config=vars(args)
+        config=vars(args),
+        tags=["final_arch"]
     )
 
     model, preprocess = clip.load(args.architecture, device=device, jit=False) 
-    
     model = model.float()
+
+    if "ViT" in args.architecture:
+        param_count = configure_model_freezing(model, args.freeze)
+    else:
+        raise Exception('can only freeze ViTs')
+
+    wandb.config.update({"trainable_params": param_count})
+
+    target_tau = args.temperature
+    with torch.no_grad():
+        model.logit_scale.data = torch.ones([]) * np.log(1 / target_tau)
+        model.logit_scale.data = model.logit_scale.data.to(device)
+
+    optimizer_params = []
+    
+    base_params = [p for name, p in model.named_parameters() if "logit_scale" not in name and p.requires_grad]
+    optimizer_params.append({'params': base_params, 'lr': args.lr})
+
+    if args.learn_temperature:
+        print(f"Temperature is TRAINABLE. Initialized to {target_tau}")
+        
+        tau_lr = args.tau_lr if args.tau_lr is not None else args.lr
+        print(f" -> Tau Learning Rate: {tau_lr}")
+        
+        optimizer_params.append({'params': [model.logit_scale], 'lr': tau_lr})
+    else:
+        print(f"Temperature is FIXED at {target_tau}")
+        model.logit_scale.requires_grad = False
 
     imgs_path = os.path.join(args.data_root, 'images/jpg')
     labels_path = os.path.join(args.data_root, 'labels.npz')
@@ -185,10 +291,6 @@ def main():
     train_indices = splits['valid'] + splits['tstid']
     test_indices = splits['trnid']
     
-    #train_indices = splits['trnid']
-    #test_indices = splits['tstid'] + splits['valid']
-    
-    # Fix 1-based indexing if present
     if min(train_indices) == 1 or min(test_indices) == 1:
         train_indices = [x - 1 for x in train_indices]
         test_indices = [x - 1 for x in test_indices]
@@ -199,20 +301,21 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=8, pin_memory=True)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=8, pin_memory=True)
 
+    print(f"Training on {len(train_dataset)} images (Valid+Test splits)")
+    print(f"Validating on {len(val_dataset)} images (Train split)")
+
     optimizer = optim.AdamW(
-        model.parameters(), 
+        optimizer_params,
         lr=args.lr, 
-        betas=(args.beta1, args.beta2), 
-        eps=args.eps, 
+        betas=(0.9, 0.98), 
+        eps=1e-6, 
         weight_decay=args.wd
     )
 
-    print(f"Starting training (Float32): {len(train_dataset)} train, {len(val_dataset)} val")
-    
     best_val_loss = float('inf')
 
     for epoch in range(args.epochs):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch)
+        train_loss = train_one_epoch(model, train_loader, optimizer, device)
         val_loss = validate_loss(model, val_loader, device)
 
         print(f"Epoch {epoch+1}/{args.epochs} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
@@ -238,7 +341,7 @@ def main():
 
     precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='weighted', zero_division=0)
 
-    print(f"Final Accuracy (Top-1): {acc1:.4f}")
+    print(f"Final Test Accuracy (Top-1): {acc1:.4f}")
     
     wandb.log({
         "eval/accuracy": acc1,
